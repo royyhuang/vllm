@@ -810,6 +810,18 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             "kv_tunnel_mvp"
         ):
             num_fake = int(request.kv_transfer_params["num_fake"])
+            # Drive the tracker state machine. update_state_after_alloc
+            # transitions PREFETCHING → WAITING_FOR_LOAD only when
+            # needs_retrieve() is true, which requires
+            # num_lmcache_hit_blocks > num_vllm_hit_blocks. Without this
+            # the tracker skips WAITING_FOR_LOAD →
+            # _process_retrieve_requests never builds a LoadStoreOp → no
+            # RETRIEVE ever fires and the request sits in
+            # WAITING_FOR_REMOTE_KVS forever. num_fake is in token units;
+            # convert to vLLM-block units to match the stock path's
+            # computation.
+            tracker.num_vllm_hit_blocks = 0
+            tracker.num_lmcache_hit_blocks = num_fake // self.vllm_block_size
             return num_fake, True
 
         self.scheduler_adapter.maybe_submit_lookup_request(
