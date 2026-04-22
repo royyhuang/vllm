@@ -227,6 +227,13 @@ class LMCacheMPRequestTracker:
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
         self.state = LMCacheMPRequestState.PREFETCHING
+        # Phase 3 — KV tunneling side-channel. Passed through from the
+        # OpenAI request's top-level kv_transfer_params. Consumed by
+        # get_num_new_matched_tokens (short-circuit) and by
+        # GetRetrieveMetadata (to build the tunneled LoadStoreOp).
+        self.kv_transfer_params: dict[str, Any] | None = getattr(
+            request, "kv_transfer_params", None
+        )
 
     ####
     # Check the state of the request
@@ -382,6 +389,31 @@ class LMCacheMPRequestMetadata:
             blocks_in_chunk: the number of blocks in a LMCache data chunk
             vllm_block_size: the block size used in vLLM
         """
+        # Phase 3 — KV tunneling: when the request carries the
+        # kv_tunnel_mvp signature, build a LoadStoreOp that bypasses
+        # token-hash lookup. block_ids covers only the slots the
+        # marshalled blob occupies (num_fake rounded up to whole blocks).
+        kv_params = tracker.kv_transfer_params
+        if kv_params and kv_params.get("kv_tunnel_mvp"):
+            num_fake = int(kv_params["num_fake"])
+            num_blocks_needed = (num_fake + vllm_block_size - 1) // vllm_block_size
+            op = LoadStoreOp(
+                block_ids=tracker.allocated_block_ids[:num_blocks_needed],
+                token_ids=[],
+                start=0,
+                end=num_fake,
+                marshal_handle=kv_params["marshal_handle"],
+            )
+            # tracker.request_id is vLLM's internal request id — unrelated
+            # to our marshal_handle; LMCacheMPRequestMetadata uses it for
+            # its own bookkeeping and expects the vLLM id here.
+            return LMCacheMPRequestMetadata(
+                request_id=tracker.request_id,
+                direction="RETRIEVE",
+                op=op,
+                cache_salt=tracker.cache_salt,
+            )
+
         if not tracker.is_ready_for_retrieving():
             return None
 
@@ -765,6 +797,20 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         # TODO: support loading KV for preempted requests in the future
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
+
+        # Phase 3 — KV tunneling short-circuit. The proxy sets
+        # kv_transfer_params["kv_tunnel_mvp"]=True + num_fake + marshal_handle
+        # so we know how many fake slots to reserve without any token-hash
+        # lookup. Returning (num_fake, True) asks the scheduler to allocate
+        # num_fake "external" blocks and load them asynchronously via
+        # RETRIEVE (which will redeem marshal_handle against the LMCache
+        # workspace). This also naturally skips the lookup RPC below
+        # (Phase 3 step 6).
+        if request.kv_transfer_params and request.kv_transfer_params.get(
+            "kv_tunnel_mvp"
+        ):
+            num_fake = int(request.kv_transfer_params["num_fake"])
+            return num_fake, True
 
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
