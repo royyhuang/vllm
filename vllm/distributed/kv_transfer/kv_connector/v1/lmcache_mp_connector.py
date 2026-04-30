@@ -472,16 +472,21 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
-        # KV-tunneling per-step snapshot. Maps long-name request_id ->
-        # (per-rank manifest, first_block_id). The connector populates
-        # this in build_connector_meta for every scheduled tunneled
-        # request — both new and cached. Worker rebuilds its registry
-        # from this dict every step (atomic replace), so requests
-        # absent here are dropped automatically.
-        # See plan/tunneled-metadata-for-cuda-graph/design.md §3.4.
-        self.tunneled_manifests: dict[
-            str, tuple[dict[int, TunneledRequestMetadata], int]
-        ] = {}
+        # KV-tunneling per-step snapshot. Maps the request's
+        # first_block_id (the GPU paged-cache block holding chunk 0
+        # of the marshalled blob, allocated uniquely by KVCacheManager
+        # and stable for the request's lifetime) to its per-rank
+        # manifest dict. The worker rebuilds its registry from this
+        # dict every step (atomic replace), so requests absent here
+        # are dropped automatically.
+        #
+        # Keying by first_block_id (rather than request_id) lets the
+        # builder do a single batched ``block_table_tensor[:num_reqs,
+        # 0].cpu()`` and look up each row's manifest without needing
+        # ``input_batch.req_ids`` — which would require a vLLM core
+        # change or a runtime monkey-patch. See
+        # plan/tunneled-metadata-for-cuda-graph/design.md §3.4.
+        self.tunneled_manifests: dict[int, dict[int, TunneledRequestMetadata]] = {}
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)
@@ -599,6 +604,72 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         logger.info("Registering kv caches!")
         self.worker_adapter.register_kv_caches(kv_caches)
         return
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        """Republish the per-step tunneling snapshot to the worker
+        registry BEFORE any attention metadata builder runs.
+
+        Overrides the base no-op. ``handle_preemptions`` is the only
+        existing per-step hook the gpu_model_runner invokes between
+        binding ``kv_connector_metadata`` and calling
+        ``_build_attention_metadata`` (see
+        ``deps/vllm/vllm/v1/worker/gpu_model_runner.py:3819``); we
+        repurpose it for kvtunnel registry-publish so the plugin
+        doesn't require any vLLM core changes.
+
+        Picks this rank's manifest out of the per-rank dict shipped on
+        ``LMCacheMPConnectorMetadata.tunneled_manifests`` and
+        atomically swaps the registry; the
+        ``KVTunnelMetadataBuilder`` reads via
+        ``kvtunnel.integration.tunnel_registry.get(req_id)``.
+
+        Falls back to ``per_rank[0]`` for the rank-invariant single-
+        rank case (most common; the pack emits the same manifest for
+        every TP rank under StreamingLLM). MLA collapses all
+        TP-co-located ranks to ``kv_rank=0`` per
+        ``extract_world_size_and_kv_rank``.
+
+        LMCacheMPConnector has no preemption work today (the base
+        class's no-op was sufficient for stock LMCache); the comment
+        below carries that context.
+        """
+        # No native preemption handling for LMCacheMPConnector — the
+        # base no-op suffices. Below we only do the kvtunnel registry
+        # publish.
+        if not isinstance(kv_connector_metadata, LMCacheMPConnectorMetadata):
+            return
+        # Empty-manifests fast path: skip the kvtunnel import + registry
+        # update entirely. Stock LMCache flows (no proxy, no tunnel)
+        # take this branch every step. Defensive bonus: a half-installed
+        # kvtunnel plugin can still serve untunneled requests because we
+        # never touch ``kvtunnel.integration`` here.
+        if not kv_connector_metadata.tunneled_manifests:
+            return
+        # Local import: tunnel_registry lives under kvtunnel/, which is
+        # NOT importable until the kvtunnel plugin registers. Loading
+        # it at module-import time would force vLLM-only configurations
+        # (no kv tunneling) to take a hard dependency on kvtunnel.
+        from kvtunnel.integration import tunnel_registry
+
+        parallel = self._vllm_config.parallel_config
+        _, my_kv_rank = extract_world_size_and_kv_rank(
+            parallel.world_size, parallel.rank, self._vllm_config
+        )
+        new_snapshot: dict[int, TunneledRequestMetadata] = {}
+        for (
+            first_block_id,
+            per_rank,
+        ) in kv_connector_metadata.tunneled_manifests.items():
+            manifest = per_rank.get(my_kv_rank)
+            if manifest is None:
+                # Rank-invariant fallback: StreamingLLM packs identical
+                # manifests for every TP rank, but only ships rank 0 to
+                # save bytes when the pack hasn't bothered to fan out.
+                manifest = per_rank.get(0)
+            if manifest is None:
+                continue
+            new_snapshot[first_block_id] = manifest
+        tunnel_registry.replace_snapshot(new_snapshot)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
@@ -1033,8 +1104,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             tracker._kvtunnel_first_block_id = new_req.block_ids[0][0]
 
         # 2) Per-step snapshot — re-emit for every scheduled tunneled
-        # request (new + cached). Use long-name `tracker.request_id` to
-        # match the worker registry's lookup key.
+        # request (new + cached). Key by ``first_block_id`` so the
+        # builder can look up by ``block_table_tensor[req_idx, 0]``
+        # without needing access to ``input_batch.req_ids``.
         scheduled_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
         scheduled_ids |= set(scheduler_output.scheduled_cached_reqs.req_ids)
         for tracker in self.request_trackers.values():
@@ -1042,9 +1114,8 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 continue
             if not hasattr(tracker, "_kvtunnel_manifest"):
                 continue
-            metadata.tunneled_manifests[tracker.request_id] = (
-                tracker._kvtunnel_manifest,
-                tracker._kvtunnel_first_block_id,
+            metadata.tunneled_manifests[tracker._kvtunnel_first_block_id] = (
+                tracker._kvtunnel_manifest
             )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
