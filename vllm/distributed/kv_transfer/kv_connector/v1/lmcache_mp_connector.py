@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import base64
 import enum
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+import msgspec
 import torch
 import zmq
+from kvtunnel.marshal.pack import TunneledRequestMetadata
 from lmcache.integration.vllm.utils import mla_enabled
 from lmcache.utils import init_logger as lmcache_init_logger
 
@@ -469,6 +472,16 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
+        # KV-tunneling per-step snapshot. Maps long-name request_id ->
+        # (per-rank manifest, first_block_id). The connector populates
+        # this in build_connector_meta for every scheduled tunneled
+        # request — both new and cached. Worker rebuilds its registry
+        # from this dict every step (atomic replace), so requests
+        # absent here are dropped automatically.
+        # See plan/tunneled-metadata-for-cuda-graph/design.md §3.4.
+        self.tunneled_manifests: dict[
+            str, tuple[dict[int, TunneledRequestMetadata], int]
+        ] = {}
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)
@@ -951,6 +964,14 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
 
+        # KV tunneling — stage per-step manifest snapshot for the
+        # worker registry. Decoded once at first sight (scheduled_new),
+        # cached on the tracker, then re-emitted every step the request
+        # is scheduled (new OR cached) so the worker can rebuild its
+        # registry atomically. See
+        # plan/tunneled-metadata-for-cuda-graph/design.md §3.4.
+        self._stage_tunneled_manifests(scheduler_output, metadata)
+
         if len(metadata) > 0:
             logger.debug("Final connector metadata: %s", metadata)
 
@@ -958,6 +979,73 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         self._report_block_allocation_deltas(scheduler_output)
 
         return metadata
+
+    def _stage_tunneled_manifests(
+        self,
+        scheduler_output: SchedulerOutput,
+        metadata: LMCacheMPConnectorMetadata,
+    ) -> None:
+        """Decode + stage tunneling manifests onto ``metadata``.
+
+        First sight (request appears in ``scheduled_new_reqs``): decode
+        the base64+msgpack manifest from
+        ``tracker.kv_transfer_params["tunneled_request_per_rank_b64"]``
+        and stash it on the tracker along with
+        ``new_req.block_ids[0][0]`` (the first allocated block — that's
+        where chunk 0's header lands; rank-invariant per design §3.4).
+
+        Every step (new OR cached): re-emit the cached
+        ``(manifest, first_block_id)`` into ``metadata.tunneled_manifests``
+        so the worker's ``pre_build_hook`` snapshot is complete for this
+        step. Mid-decode requests (no STORE/RETRIEVE) would otherwise be
+        absent from ``metadata.requests`` and silently dropped.
+        """
+        # 1) First-sight decode + cache on tracker.
+        for new_req in scheduler_output.scheduled_new_reqs:
+            tracker = self._get_request_tracker(new_req.req_id)
+            params = tracker.kv_transfer_params or {}
+            b64 = params.get("tunneled_request_per_rank_b64")
+            if b64 is None:
+                continue
+            if hasattr(tracker, "_kvtunnel_manifest"):
+                continue  # already decoded for this tracker
+            try:
+                tracker._kvtunnel_manifest = msgspec.msgpack.decode(
+                    base64.b64decode(b64),
+                    type=dict[int, TunneledRequestMetadata],
+                )
+            except (ValueError, TypeError, msgspec.DecodeError):
+                # Narrow set: ValueError covers binascii.Error from
+                # b64decode; msgspec.DecodeError covers malformed
+                # msgpack payloads / type-shape mismatches; TypeError
+                # covers non-bytes inputs. Anything else is a real bug
+                # we want to crash on rather than silently drop tunneling.
+                logger.exception(
+                    "Failed to decode tunneled_request_per_rank_b64 for "
+                    "req_id=%s — skipping tunnel for this request.",
+                    new_req.req_id,
+                )
+                continue
+            # block_ids[0] = first kv-cache-group's block list; [0] =
+            # request's first allocated block. KVCacheManager allocates
+            # block 0 per-request once at admission and never moves it,
+            # so this stays stable across decode steps (design §4.4).
+            tracker._kvtunnel_first_block_id = new_req.block_ids[0][0]
+
+        # 2) Per-step snapshot — re-emit for every scheduled tunneled
+        # request (new + cached). Use long-name `tracker.request_id` to
+        # match the worker registry's lookup key.
+        scheduled_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        scheduled_ids |= set(scheduler_output.scheduled_cached_reqs.req_ids)
+        for tracker in self.request_trackers.values():
+            if tracker.request_id not in scheduled_ids:
+                continue
+            if not hasattr(tracker, "_kvtunnel_manifest"):
+                continue
+            metadata.tunneled_manifests[tracker.request_id] = (
+                tracker._kvtunnel_manifest,
+                tracker._kvtunnel_first_block_id,
+            )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
