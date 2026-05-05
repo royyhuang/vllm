@@ -357,13 +357,57 @@ class LMCacheMPRequestMetadata:
             block_ids = tracker.allocated_block_ids[start:end]
             start_token_idx = start * vllm_block_size
             end_token_idx = end * vllm_block_size
-            token_ids = list(tracker.all_token_ids)
-            op = LoadStoreOp(
-                token_ids=token_ids,
-                block_ids=block_ids,
-                start=start_token_idx,
-                end=end_token_idx,
-            )
+
+            # KV-tunneling cycle path: when the request carries
+            # `kvtunnel_real_token_ids`, the tracker's `all_token_ids`
+            # is the dummy-padded sequence that vLLM actually scheduled;
+            # the LMCache STORE must instead key under the REAL chain
+            # so subsequent cycles' MARSHAL hits. Override `token_ids`
+            # with `real_prompt + decoded_suffix` and shift start/end
+            # into that chain. `block_ids` is unchanged — the
+            # kv_tunnel_mvp short-circuit advances `num_stored_blocks`
+            # past the dummy region, so the stock slice already covers
+            # exactly the new decoded chunk's vLLM blocks.
+            kv_params = tracker.kv_transfer_params or {}
+            real_token_ids = kv_params.get("kvtunnel_real_token_ids")
+            if real_token_ids:
+                # Both keys must travel together (proxy contract).
+                # Failing loud here beats silently shipping a STORE
+                # whose dummy prefix wasn't stripped.
+                num_fake_raw = kv_params.get("num_fake")
+                if num_fake_raw is None:
+                    raise ValueError(
+                        "kvtunnel_real_token_ids requires num_fake "
+                        "in kv_transfer_params; got None"
+                    )
+                num_fake = int(num_fake_raw)
+                # Decoded suffix lives in tracker.all_token_ids past
+                # the dummy region. Compose: real prefix + decoded.
+                # `tracker.all_token_ids[num_fake:]` already returns
+                # a fresh list (ConstantList.__getitem__ delegates
+                # to list.__getitem__(slice) which allocates), so
+                # we don't wrap it in another `list(...)`.
+                substituted_token_ids = list(real_token_ids)
+                substituted_token_ids += tracker.all_token_ids[num_fake:]
+                # Real-chain offsets (token-units): drop the dummy
+                # prefix (`start_token_idx - num_fake`) and add the
+                # real prefix (`len(real_token_ids)`).
+                real_chain_start = len(real_token_ids) + (start_token_idx - num_fake)
+                real_chain_end = real_chain_start + (end_token_idx - start_token_idx)
+                op = LoadStoreOp(
+                    token_ids=substituted_token_ids,
+                    block_ids=block_ids,
+                    start=real_chain_start,
+                    end=real_chain_end,
+                )
+            else:
+                token_ids = list(tracker.all_token_ids)
+                op = LoadStoreOp(
+                    token_ids=token_ids,
+                    block_ids=block_ids,
+                    start=start_token_idx,
+                    end=end_token_idx,
+                )
 
             ret = LMCacheMPRequestMetadata(
                 request_id=tracker.request_id,
@@ -906,6 +950,18 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             # computation.
             tracker.num_vllm_hit_blocks = 0
             tracker.num_lmcache_hit_blocks = num_fake // self.vllm_block_size
+            # Advance num_stored_blocks past the dummy region so the
+            # FIRST GetStoreMetadata after this short-circuit emits a
+            # STORE that begins at the decoded region (block index
+            # num_fake / vllm_block_size), not at slot 0. Without
+            # this, the first STORE would include the dummy blocks
+            # and the connector would write dummy K/V under the hash
+            # for real_token_ids[0:chunk_size], corrupting the real
+            # chain. Uses the public mutator to document intent and
+            # avoid encapsulation drift; the LOOKUP-path advance
+            # (`tracker.increase_num_stored_blocks(num_lmcache_blocks)`
+            # below) is unreached because we `return` here.
+            tracker.increase_num_stored_blocks(num_fake // self.vllm_block_size)
             return num_fake, True
 
         self.scheduler_adapter.maybe_submit_lookup_request(
