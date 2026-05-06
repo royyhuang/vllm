@@ -343,11 +343,44 @@ class LMCacheMPRequestMetadata:
         computed_blocks = tracker.num_scheduled_tokens // vllm_block_size + max(
             tracker.num_vllm_hit_blocks, tracker.num_lmcache_hit_blocks
         )
-        min_available_blocks = min(
-            len(tracker.block_hashes),
-            len(tracker.allocated_block_ids),
-            computed_blocks,
-        )
+        # KV-tunneling: skip ``len(block_hashes)`` in the upper-bound
+        # for tunneled requests. block_hashes lags allocated_block_ids
+        # by one at the final decode step (no NEXT step to update
+        # it), which silently drops the request's last chunk's STORE
+        # — see plan/proxy-re-tunnel-cycles/design.md §"GetStore
+        # off-by-one fix". For the substituted-STORE path (token_ids
+        # rewritten to real_prompt + decoded), LMCache hashes
+        # server-side from those tokens via TokenHasher; vLLM's
+        # block_hashes is never consumed downstream, so removing it
+        # from the bound is safe. Stock STORE path (no
+        # ``kvtunnel_real_token_ids``) keeps the original bound to
+        # respect vLLM APC's hash-based invariants.
+        _kv_params = tracker.kv_transfer_params or {}
+        _is_tunneled = bool(_kv_params.get("kvtunnel_real_token_ids"))
+        if _is_tunneled:
+            # Tunneled bound additionally caps by
+            # ``len(all_token_ids) // vllm_block_size``. ``all_token_ids``
+            # lags ``allocated_block_ids`` by one token at the final
+            # decode step (sampling runs AFTER _process_cached_requests
+            # builds metadata). Without this cap the substituted
+            # ``token_ids = real + all_token_ids[num_fake:]`` is one
+            # token short of the chunk boundary; LMCache hashes a
+            # truncated last chunk and the proxy MARSHAL will never
+            # match. The cap defers the STORE op to the next scheduler
+            # tick where all_token_ids has caught up — which the proxy
+            # ensures by sending ``max_tokens = chunk_size + 1`` so an
+            # extra tick exists.
+            min_available_blocks = min(
+                len(tracker.allocated_block_ids),
+                computed_blocks,
+                len(tracker.all_token_ids) // vllm_block_size,
+            )
+        else:
+            min_available_blocks = min(
+                len(tracker.block_hashes),
+                len(tracker.allocated_block_ids),
+                computed_blocks,
+            )
         num_staging_blocks = min_available_blocks - tracker.num_stored_blocks
         num_chunks = num_staging_blocks // blocks_in_chunk
 
