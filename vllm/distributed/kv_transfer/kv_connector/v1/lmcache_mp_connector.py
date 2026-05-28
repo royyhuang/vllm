@@ -687,7 +687,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         existing per-step hook the gpu_model_runner invokes between
         binding ``kv_connector_metadata`` and calling
         ``_build_attention_metadata`` (see
-        ``deps/vllm/vllm/v1/worker/gpu_model_runner.py:3819``); we
+        ``deps/vllm/vllm/v1/worker/gpu_model_runner.py:3809``); we
         repurpose it for kvtunnel registry-publish so the plugin
         doesn't require any vLLM core changes.
 
