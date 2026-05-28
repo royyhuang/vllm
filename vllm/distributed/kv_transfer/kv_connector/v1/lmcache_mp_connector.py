@@ -345,16 +345,14 @@ class LMCacheMPRequestMetadata:
         )
         # KV-tunneling: skip ``len(block_hashes)`` in the upper-bound
         # for tunneled requests. block_hashes lags allocated_block_ids
-        # by one at the final decode step (no NEXT step to update
-        # it), which silently drops the request's last chunk's STORE
-        # — see plan/proxy-re-tunnel-cycles/design.md §"GetStore
-        # off-by-one fix". For the substituted-STORE path (token_ids
-        # rewritten to real_prompt + decoded), LMCache hashes
-        # server-side from those tokens via TokenHasher; vLLM's
-        # block_hashes is never consumed downstream, so removing it
-        # from the bound is safe. Stock STORE path (no
-        # ``kvtunnel_real_token_ids``) keeps the original bound to
-        # respect vLLM APC's hash-based invariants.
+        # by one at the final decode step (no NEXT step to update it),
+        # which would silently drop the request's last chunk's STORE.
+        # For the substituted-STORE path (token_ids rewritten to
+        # real_prompt + decoded), LMCache hashes server-side from those
+        # tokens via TokenHasher; vLLM's block_hashes is never consumed
+        # downstream, so removing it from the bound is safe. Stock STORE
+        # path (no ``kvtunnel_real_token_ids``) keeps the original bound
+        # to respect vLLM APC's hash-based invariants.
         _kv_params = tracker.kv_transfer_params or {}
         _is_tunneled = bool(_kv_params.get("kvtunnel_real_token_ids"))
         if _is_tunneled:
@@ -561,8 +559,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         # builder do a single batched ``block_table_tensor[:num_reqs,
         # 0].cpu()`` and look up each row's manifest without needing
         # ``input_batch.req_ids`` — which would require a vLLM core
-        # change or a runtime monkey-patch. See
-        # plan/tunneled-metadata-for-cuda-graph/design.md §3.4.
+        # change or a runtime monkey-patch.
         self.tunneled_manifests: dict[int, dict[int, TunneledRequestMetadata]] = {}
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
@@ -1128,8 +1125,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         # worker registry. Decoded once at first sight (scheduled_new),
         # cached on the tracker, then re-emitted every step the request
         # is scheduled (new OR cached) so the worker can rebuild its
-        # registry atomically. See
-        # plan/tunneled-metadata-for-cuda-graph/design.md §3.4.
+        # registry atomically.
         self._stage_tunneled_manifests(scheduler_output, metadata)
 
         if len(metadata) > 0:
@@ -1152,7 +1148,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         ``tracker.kv_transfer_params["tunneled_request_per_rank_b64"]``
         and stash it on the tracker along with
         ``new_req.block_ids[0][0]`` (the first allocated block — that's
-        where chunk 0's header lands; rank-invariant per design §3.4).
+        where chunk 0's header lands; rank-invariant).
 
         Every step (new OR cached): re-emit the cached
         ``(manifest, first_block_id)`` into ``metadata.tunneled_manifests``
@@ -1189,7 +1185,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             # block_ids[0] = first kv-cache-group's block list; [0] =
             # request's first allocated block. KVCacheManager allocates
             # block 0 per-request once at admission and never moves it,
-            # so this stays stable across decode steps (design §4.4).
+            # so this stays stable across decode steps.
             tracker._kvtunnel_first_block_id = new_req.block_ids[0][0]
 
         # 2) Per-step snapshot — re-emit for every scheduled tunneled
