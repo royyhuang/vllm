@@ -230,7 +230,7 @@ class LMCacheMPRequestTracker:
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
         self.state = LMCacheMPRequestState.PREFETCHING
-        # Phase 3 — KV tunneling side-channel. Passed through from the
+        # KV tunneling side-channel. Passed through from the
         # OpenAI request's top-level kv_transfer_params. Consumed by
         # get_num_new_matched_tokens (short-circuit) and by
         # GetRetrieveMetadata (to build the tunneled LoadStoreOp).
@@ -467,7 +467,7 @@ class LMCacheMPRequestMetadata:
             blocks_in_chunk: the number of blocks in a LMCache data chunk
             vllm_block_size: the block size used in vLLM
         """
-        # Phase 3 — KV tunneling: when the request carries the
+        # KV tunneling: when the request carries the
         # kv_tunnel_mvp signature, build a LoadStoreOp that bypasses
         # token-hash lookup. block_ids covers only the slots the
         # marshalled blob occupies (num_fake rounded up to whole blocks).
@@ -956,14 +956,13 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
-        # Phase 3 — KV tunneling short-circuit. The proxy sets
+        # KV tunneling short-circuit. The proxy sets
         # kv_transfer_params["kv_tunnel_mvp"]=True + num_fake + marshal_handle
         # so we know how many fake slots to reserve without any token-hash
         # lookup. Returning (num_fake, True) asks the scheduler to allocate
         # num_fake "external" blocks and load them asynchronously via
         # RETRIEVE (which will redeem marshal_handle against the LMCache
-        # workspace). This also naturally skips the lookup RPC below
-        # (Phase 3 step 6).
+        # workspace). This also naturally skips the lookup RPC below.
         if request.kv_transfer_params and request.kv_transfer_params.get(
             "kv_tunnel_mvp"
         ):
