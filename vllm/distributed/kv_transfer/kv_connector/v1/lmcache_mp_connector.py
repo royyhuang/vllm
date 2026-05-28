@@ -703,20 +703,17 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         TP-co-located ranks to ``kv_rank=0`` per
         ``extract_world_size_and_kv_rank``.
 
-        LMCacheMPConnector has no preemption work today (the base
-        class's no-op was sufficient for stock LMCache); the comment
-        below carries that context.
+        LMCacheMPConnector has no preemption work of its own; the base
+        no-op suffices. This override exists only for the registry
+        publish.
         """
-        # No native preemption handling for LMCacheMPConnector — the
-        # base no-op suffices. Below we only do the kvtunnel registry
-        # publish.
         if not isinstance(kv_connector_metadata, LMCacheMPConnectorMetadata):
             return
         # Empty-manifests fast path: skip the kvtunnel import + registry
-        # update entirely. Stock LMCache flows (no proxy, no tunnel)
-        # take this branch every step. Defensive bonus: a half-installed
-        # kvtunnel plugin can still serve untunneled requests because we
-        # never touch ``kvtunnel.integration`` here.
+        # update entirely. Stock LMCache flows (no proxy, no tunnel) take
+        # this branch every step, and never touch ``kvtunnel.integration``
+        # — so a half-installed kvtunnel plugin can still serve untunneled
+        # requests.
         if not kv_connector_metadata.tunneled_manifests:
             return
         # Local import: tunnel_registry lives under kvtunnel/, which is
