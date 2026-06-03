@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import base64
 import enum
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
-import msgspec
 import torch
 import zmq
-from kvtunnel.marshal.pack import TunneledRequestMetadata
 from lmcache.integration.vllm.utils import mla_enabled
 from lmcache.utils import init_logger as lmcache_init_logger
 
@@ -231,13 +228,6 @@ class LMCacheMPRequestTracker:
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
         self.state = LMCacheMPRequestState.PREFETCHING
-        # KV tunneling side-channel. Passed through from the
-        # OpenAI request's top-level kv_transfer_params. Consumed by
-        # get_num_new_matched_tokens (short-circuit) and by
-        # GetRetrieveMetadata (to build the tunneled LoadStoreOp).
-        self.kv_transfer_params: dict[str, Any] | None = getattr(
-            request, "kv_transfer_params", None
-        )
 
     ####
     # Check the state of the request
@@ -344,42 +334,11 @@ class LMCacheMPRequestMetadata:
         computed_blocks = tracker.num_scheduled_tokens // vllm_block_size + max(
             tracker.num_vllm_hit_blocks, tracker.num_lmcache_hit_blocks
         )
-        # KV-tunneling: skip ``len(block_hashes)`` in the upper-bound
-        # for tunneled requests. block_hashes lags allocated_block_ids
-        # by one at the final decode step (no NEXT step to update it),
-        # which would silently drop the request's last chunk's STORE.
-        # For the substituted-STORE path (token_ids rewritten to
-        # real_prompt + decoded), LMCache hashes server-side from those
-        # tokens via TokenHasher; vLLM's block_hashes is never consumed
-        # downstream, so removing it from the bound is safe. Stock STORE
-        # path (no ``kvtunnel_real_token_ids``) keeps the original bound
-        # to respect vLLM APC's hash-based invariants.
-        _kv_params = tracker.kv_transfer_params or {}
-        _is_tunneled = bool(_kv_params.get("kvtunnel_real_token_ids"))
-        if _is_tunneled:
-            # Tunneled bound additionally caps by
-            # ``len(all_token_ids) // vllm_block_size``. ``all_token_ids``
-            # lags ``allocated_block_ids`` by one token at the final
-            # decode step (sampling runs AFTER _process_cached_requests
-            # builds metadata). Without this cap the substituted
-            # ``token_ids = real + all_token_ids[num_fake:]`` is one
-            # token short of the chunk boundary; LMCache hashes a
-            # truncated last chunk and the proxy MARSHAL will never
-            # match. The cap defers the STORE op to the next scheduler
-            # tick where all_token_ids has caught up — which the proxy
-            # ensures by sending ``max_tokens = chunk_size + 1`` so an
-            # extra tick exists.
-            min_available_blocks = min(
-                len(tracker.allocated_block_ids),
-                computed_blocks,
-                len(tracker.all_token_ids) // vllm_block_size,
-            )
-        else:
-            min_available_blocks = min(
-                len(tracker.block_hashes),
-                len(tracker.allocated_block_ids),
-                computed_blocks,
-            )
+        min_available_blocks = min(
+            len(tracker.block_hashes),
+            len(tracker.allocated_block_ids),
+            computed_blocks,
+        )
         num_staging_blocks = min_available_blocks - tracker.num_stored_blocks
         num_chunks = num_staging_blocks // blocks_in_chunk
 
@@ -389,57 +348,13 @@ class LMCacheMPRequestMetadata:
             block_ids = tracker.allocated_block_ids[start:end]
             start_token_idx = start * vllm_block_size
             end_token_idx = end * vllm_block_size
-
-            # KV-tunneling cycle path: when the request carries
-            # `kvtunnel_real_token_ids`, the tracker's `all_token_ids`
-            # is the dummy-padded sequence that vLLM actually scheduled;
-            # the LMCache STORE must instead key under the REAL chain
-            # so subsequent cycles' MARSHAL hits. Override `token_ids`
-            # with `real_prompt + decoded_suffix` and shift start/end
-            # into that chain. `block_ids` is unchanged — the
-            # kv_tunnel_mvp short-circuit advances `num_stored_blocks`
-            # past the dummy region, so the stock slice already covers
-            # exactly the new decoded chunk's vLLM blocks.
-            kv_params = tracker.kv_transfer_params or {}
-            real_token_ids = kv_params.get("kvtunnel_real_token_ids")
-            if real_token_ids:
-                # Both keys must travel together (proxy contract).
-                # Failing loud here beats silently shipping a STORE
-                # whose dummy prefix wasn't stripped.
-                num_fake_raw = kv_params.get("num_fake")
-                if num_fake_raw is None:
-                    raise ValueError(
-                        "kvtunnel_real_token_ids requires num_fake "
-                        "in kv_transfer_params; got None"
-                    )
-                num_fake = int(num_fake_raw)
-                # Decoded suffix lives in tracker.all_token_ids past
-                # the dummy region. Compose: real prefix + decoded.
-                # `tracker.all_token_ids[num_fake:]` already returns
-                # a fresh list (ConstantList.__getitem__ delegates
-                # to list.__getitem__(slice) which allocates), so
-                # we don't wrap it in another `list(...)`.
-                substituted_token_ids = list(real_token_ids)
-                substituted_token_ids += tracker.all_token_ids[num_fake:]
-                # Real-chain offsets (token-units): drop the dummy
-                # prefix (`start_token_idx - num_fake`) and add the
-                # real prefix (`len(real_token_ids)`).
-                real_chain_start = len(real_token_ids) + (start_token_idx - num_fake)
-                real_chain_end = real_chain_start + (end_token_idx - start_token_idx)
-                op = LoadStoreOp(
-                    token_ids=substituted_token_ids,
-                    block_ids=block_ids,
-                    start=real_chain_start,
-                    end=real_chain_end,
-                )
-            else:
-                token_ids = list(tracker.all_token_ids)
-                op = LoadStoreOp(
-                    token_ids=token_ids,
-                    block_ids=block_ids,
-                    start=start_token_idx,
-                    end=end_token_idx,
-                )
+            token_ids = list(tracker.all_token_ids)
+            op = LoadStoreOp(
+                token_ids=token_ids,
+                block_ids=block_ids,
+                start=start_token_idx,
+                end=end_token_idx,
+            )
 
             ret = LMCacheMPRequestMetadata(
                 request_id=tracker.request_id,
@@ -468,31 +383,6 @@ class LMCacheMPRequestMetadata:
             blocks_in_chunk: the number of blocks in a LMCache data chunk
             vllm_block_size: the block size used in vLLM
         """
-        # KV tunneling: when the request carries the
-        # kv_tunnel_mvp signature, build a LoadStoreOp that bypasses
-        # token-hash lookup. block_ids covers only the slots the
-        # marshalled blob occupies (num_fake rounded up to whole blocks).
-        kv_params = tracker.kv_transfer_params
-        if kv_params and kv_params.get("kv_tunnel_mvp"):
-            num_fake = int(kv_params["num_fake"])
-            num_blocks_needed = (num_fake + vllm_block_size - 1) // vllm_block_size
-            op = LoadStoreOp(
-                block_ids=tracker.allocated_block_ids[:num_blocks_needed],
-                token_ids=[],
-                start=0,
-                end=num_fake,
-                marshal_handle=kv_params["marshal_handle"],
-            )
-            # tracker.request_id is vLLM's internal request id — unrelated
-            # to our marshal_handle; LMCacheMPRequestMetadata uses it for
-            # its own bookkeeping and expects the vLLM id here.
-            return LMCacheMPRequestMetadata(
-                request_id=tracker.request_id,
-                direction="RETRIEVE",
-                op=op,
-                cache_salt=tracker.cache_salt,
-            )
-
         if not tracker.is_ready_for_retrieving():
             return None
 
@@ -548,20 +438,6 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
-        # KV-tunneling per-step snapshot. Maps the request's
-        # first_block_id (the GPU paged-cache block holding chunk 0
-        # of the marshalled blob, allocated uniquely by KVCacheManager
-        # and stable for the request's lifetime) to its per-rank
-        # manifest dict. The worker rebuilds its registry from this
-        # dict every step (atomic replace), so requests absent here
-        # are dropped automatically.
-        #
-        # Keying by first_block_id (rather than request_id) lets the
-        # builder do a single batched ``block_table_tensor[:num_reqs,
-        # 0].cpu()`` and look up each row's manifest without needing
-        # ``input_batch.req_ids`` — which would require a vLLM core
-        # change or a runtime monkey-patch.
-        self.tunneled_manifests: dict[int, dict[int, TunneledRequestMetadata]] = {}
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)
@@ -679,69 +555,6 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         logger.info("Registering kv caches!")
         self.worker_adapter.register_kv_caches(kv_caches)
         return
-
-    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
-        """Republish the per-step tunneling snapshot to the worker
-        registry BEFORE any attention metadata builder runs.
-
-        Overrides the base no-op. ``handle_preemptions`` is the only
-        existing per-step hook the gpu_model_runner invokes between
-        binding ``kv_connector_metadata`` and calling
-        ``_build_attention_metadata`` (see
-        ``deps/vllm/vllm/v1/worker/gpu_model_runner.py:3809``); we
-        repurpose it for kvtunnel registry-publish so the plugin
-        doesn't require any vLLM core changes.
-
-        Picks this rank's manifest out of the per-rank dict shipped on
-        ``LMCacheMPConnectorMetadata.tunneled_manifests`` and
-        atomically swaps the registry; the
-        ``KVTunnelMetadataBuilder`` reads via
-        ``kvtunnel.integration.tunnel_registry.get(req_id)``.
-
-        Falls back to ``per_rank[0]`` for the rank-invariant single-
-        rank case (most common; the pack emits the same manifest for
-        every TP rank under StreamingLLM). MLA collapses all
-        TP-co-located ranks to ``kv_rank=0`` per
-        ``extract_world_size_and_kv_rank``.
-
-        LMCacheMPConnector has no preemption work of its own; the base
-        no-op suffices. This override exists only for the registry
-        publish.
-        """
-        if not isinstance(kv_connector_metadata, LMCacheMPConnectorMetadata):
-            return
-        # Empty-manifests fast path: skip the kvtunnel import + registry
-        # update entirely. Stock LMCache flows (no proxy, no tunnel) take
-        # this branch every step, and never touch ``kvtunnel.integration``
-        # — so a half-installed kvtunnel plugin can still serve untunneled
-        # requests.
-        if not kv_connector_metadata.tunneled_manifests:
-            return
-        # Local import: tunnel_registry lives under kvtunnel/, which is
-        # NOT importable until the kvtunnel plugin registers. Loading
-        # it at module-import time would force vLLM-only configurations
-        # (no kv tunneling) to take a hard dependency on kvtunnel.
-        from kvtunnel.integration import tunnel_registry
-
-        parallel = self._vllm_config.parallel_config
-        _, my_kv_rank = extract_world_size_and_kv_rank(
-            parallel.world_size, parallel.rank, self._vllm_config
-        )
-        new_snapshot: dict[int, TunneledRequestMetadata] = {}
-        for (
-            first_block_id,
-            per_rank,
-        ) in kv_connector_metadata.tunneled_manifests.items():
-            manifest = per_rank.get(my_kv_rank)
-            if manifest is None:
-                # Rank-invariant fallback: StreamingLLM packs identical
-                # manifests for every TP rank, but only ships rank 0 to
-                # save bytes when the pack hasn't bothered to fan out.
-                manifest = per_rank.get(0)
-            if manifest is None:
-                continue
-            new_snapshot[first_block_id] = manifest
-        tunnel_registry.replace_snapshot(new_snapshot)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
@@ -954,43 +767,6 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
-        # KV tunneling short-circuit. The proxy sets
-        # kv_transfer_params["kv_tunnel_mvp"]=True + num_fake + marshal_handle
-        # so we know how many fake slots to reserve without any token-hash
-        # lookup. Returning (num_fake, True) asks the scheduler to allocate
-        # num_fake "external" blocks and load them asynchronously via
-        # RETRIEVE (which will redeem marshal_handle against the LMCache
-        # workspace). This also naturally skips the lookup RPC below.
-        if request.kv_transfer_params and request.kv_transfer_params.get(
-            "kv_tunnel_mvp"
-        ):
-            num_fake = int(request.kv_transfer_params["num_fake"])
-            # Drive the tracker state machine. update_state_after_alloc
-            # transitions PREFETCHING → WAITING_FOR_LOAD only when
-            # needs_retrieve() is true, which requires
-            # num_lmcache_hit_blocks > num_vllm_hit_blocks. Without this
-            # the tracker skips WAITING_FOR_LOAD →
-            # _process_retrieve_requests never builds a LoadStoreOp → no
-            # RETRIEVE ever fires and the request sits in
-            # WAITING_FOR_REMOTE_KVS forever. num_fake is in token units;
-            # convert to vLLM-block units to match the stock path's
-            # computation.
-            tracker.num_vllm_hit_blocks = 0
-            tracker.num_lmcache_hit_blocks = num_fake // self.vllm_block_size
-            # Advance num_stored_blocks past the dummy region so the
-            # FIRST GetStoreMetadata after this short-circuit emits a
-            # STORE that begins at the decoded region (block index
-            # num_fake / vllm_block_size), not at slot 0. Without
-            # this, the first STORE would include the dummy blocks
-            # and the connector would write dummy K/V under the hash
-            # for real_token_ids[0:chunk_size], corrupting the real
-            # chain. Uses the public mutator to document intent and
-            # avoid encapsulation drift; the LOOKUP-path advance
-            # (`tracker.increase_num_stored_blocks(num_lmcache_blocks)`
-            # below) is unreached because we `return` here.
-            tracker.increase_num_stored_blocks(num_fake // self.vllm_block_size)
-            return num_fake, True
-
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=list(request.all_token_ids),
@@ -1118,13 +894,6 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
 
-        # KV tunneling — stage per-step manifest snapshot for the
-        # worker registry. Decoded once at first sight (scheduled_new),
-        # cached on the tracker, then re-emitted every step the request
-        # is scheduled (new OR cached) so the worker can rebuild its
-        # registry atomically.
-        self._stage_tunneled_manifests(scheduler_output, metadata)
-
         if len(metadata) > 0:
             logger.debug("Final connector metadata: %s", metadata)
 
@@ -1132,73 +901,6 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         self._report_block_allocation_deltas(scheduler_output)
 
         return metadata
-
-    def _stage_tunneled_manifests(
-        self,
-        scheduler_output: SchedulerOutput,
-        metadata: LMCacheMPConnectorMetadata,
-    ) -> None:
-        """Decode + stage tunneling manifests onto ``metadata``.
-
-        First sight (request appears in ``scheduled_new_reqs``): decode
-        the base64+msgpack manifest from
-        ``tracker.kv_transfer_params["tunneled_request_per_rank_b64"]``
-        and stash it on the tracker along with
-        ``new_req.block_ids[0][0]`` (the first allocated block — that's
-        where chunk 0's header lands; rank-invariant).
-
-        Every step (new OR cached): re-emit the cached
-        ``(manifest, first_block_id)`` into ``metadata.tunneled_manifests``
-        so the worker's ``pre_build_hook`` snapshot is complete for this
-        step. Mid-decode requests (no STORE/RETRIEVE) would otherwise be
-        absent from ``metadata.requests`` and silently dropped.
-        """
-        # 1) First-sight decode + cache on tracker.
-        for new_req in scheduler_output.scheduled_new_reqs:
-            tracker = self._get_request_tracker(new_req.req_id)
-            params = tracker.kv_transfer_params or {}
-            b64 = params.get("tunneled_request_per_rank_b64")
-            if b64 is None:
-                continue
-            if hasattr(tracker, "_kvtunnel_manifest"):
-                continue  # already decoded for this tracker
-            try:
-                tracker._kvtunnel_manifest = msgspec.msgpack.decode(
-                    base64.b64decode(b64),
-                    type=dict[int, TunneledRequestMetadata],
-                )
-            except (ValueError, TypeError, msgspec.DecodeError):
-                # Narrow set: ValueError covers binascii.Error from
-                # b64decode; msgspec.DecodeError covers malformed
-                # msgpack payloads / type-shape mismatches; TypeError
-                # covers non-bytes inputs. Anything else is a real bug
-                # we want to crash on rather than silently drop tunneling.
-                logger.exception(
-                    "Failed to decode tunneled_request_per_rank_b64 for "
-                    "req_id=%s — skipping tunnel for this request.",
-                    new_req.req_id,
-                )
-                continue
-            # block_ids[0] = first kv-cache-group's block list; [0] =
-            # request's first allocated block. KVCacheManager allocates
-            # block 0 per-request once at admission and never moves it,
-            # so this stays stable across decode steps.
-            tracker._kvtunnel_first_block_id = new_req.block_ids[0][0]
-
-        # 2) Per-step snapshot — re-emit for every scheduled tunneled
-        # request (new + cached). Key by ``first_block_id`` so the
-        # builder can look up by ``block_table_tensor[req_idx, 0]``
-        # without needing access to ``input_batch.req_ids``.
-        scheduled_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
-        scheduled_ids |= set(scheduler_output.scheduled_cached_reqs.req_ids)
-        for tracker in self.request_trackers.values():
-            if tracker.request_id not in scheduled_ids:
-                continue
-            if not hasattr(tracker, "_kvtunnel_manifest"):
-                continue
-            metadata.tunneled_manifests[tracker._kvtunnel_first_block_id] = (
-                tracker._kvtunnel_manifest
-            )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
